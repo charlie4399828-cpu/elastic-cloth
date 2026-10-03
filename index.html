@@ -179,11 +179,16 @@ function start() {
 
   /* ===== 物理更新：回弹弹簧 + 鼠标斥力（随距离平方衰减） ===== */
   function updatePhysics() {
+    // 可编程虚拟按压（"开始体验"按钮触发的自动演示）
+    var px = mx, py = my;
+    if (window.__virtPress && performance.now() < window.__virtPress.until) {
+      px = window.__virtPress.x; py = window.__virtPress.y;
+    }
     for (var i = 0; i < nodes.length; i++) {
       var n = nodes[i];
       var fx = (n.hx - n.x) * STIFF;
       var fy = (n.hy - n.y) * STIFF;
-      var dx = n.x - mx, dy = n.y - my;
+      var dx = n.x - px, dy = n.y - py;
       var d2 = dx * dx + dy * dy;
       if (d2 < R2) {
         var d = Math.sqrt(d2) || 0.001;
@@ -333,6 +338,7 @@ var gsapSettled = false;
     if (down) spawnTrail(e.clientX, e.clientY);
   });
 
+  window.__inkBloom = spawnBloom;
   var last = performance.now();
   function loop(now) {
     var dt = Math.min((now - last) / 1000, 0.05);
@@ -366,6 +372,31 @@ var gsapSettled = false;
     }
     requestAnimationFrame(loop);
   }
+  /* ===== "开始体验" 按钮：连环绽放 + 自动按压演示 + 操作提示 ===== */
+  var hint = null;
+  function showHint() {
+    if (hint) return;
+    hint = document.createElement('div');
+    hint.textContent = '移动鼠标按压布料 · 按住拖动画出霓虹轨迹';
+    hint.style.cssText = 'position:fixed;left:50%;bottom:12%;transform:translateX(-50%);color:#D7E2EA;font:300 15px/1.6 Kanit,sans-serif;letter-spacing:.15em;opacity:0;transition:opacity .6s;pointer-events:none;z-index:60;white-space:nowrap;text-align:center;';
+    document.body.appendChild(hint);
+    requestAnimationFrame(function(){ hint.style.opacity = '1'; });
+    setTimeout(function(){
+      if (!hint) return;
+      hint.style.opacity = '0';
+      setTimeout(function(){ if (hint && hint.parentNode) hint.parentNode.removeChild(hint); hint = null; }, 700);
+    }, 2600);
+  }
+  window.addEventListener('click', function(e) {
+    if (!(e.target && e.target.closest && e.target.closest('button'))) return;
+    var cx = window.innerWidth / 2, cy = window.innerHeight / 2;
+    setTimeout(function(){ if (window.__inkBloom) window.__inkBloom(cx, cy); }, 120);
+    setTimeout(function(){ if (window.__inkBloom) window.__inkBloom(window.innerWidth * 0.22, window.innerHeight * 0.55); }, 380);
+    setTimeout(function(){ if (window.__inkBloom) window.__inkBloom(window.innerWidth * 0.78, window.innerHeight * 0.55); }, 620);
+    window.__virtPress = { x: cx, y: cy - 20, until: performance.now() + 1400 };
+    showHint();
+  });
+
   requestAnimationFrame(loop);
 })();
 </script>
