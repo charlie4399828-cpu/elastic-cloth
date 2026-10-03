@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Elastic Cloth · 布料物理按压</title>
+<meta name="theme-color" content="#0C0C0C" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='9' fill='none' stroke='%236FA8FF' stroke-width='2'/%3E%3Ccircle cx='12' cy='12' r='3' fill='%236FA8FF'/%3E%3C/svg%3E" />
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #0C0C0C;
+  }
+  #stage {
+    position: fixed;
+    inset: 0;
+    overflow: hidden;
+  }
+  .cell {
+    position: absolute;
+    overflow: hidden;
+    will-change: transform;
+    pointer-events: none;
+  }
+  .cell-inner {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100vw;
+    height: 100vh;
+  }
+  .page {
+    width: 100vw;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 28px;
+    color: #D7E2EA;
+    font-family: "Helvetica Neue", "PingFang SC", "Microsoft YaHei", sans-serif;
+    user-select: none;
+  }
+  .page h1 {
+    margin: 0;
+    font-size: clamp(48px, 9vw, 132px);
+    font-weight: 800;
+    letter-spacing: 0.02em;
+    background: linear-gradient(180deg, #646973 0%, #BBCCD7 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  .page p {
+    margin: 0;
+    font-size: 15px;
+    letter-spacing: 0.25em;
+    text-transform: uppercase;
+    opacity: 0.7;
+  }
+  .page button {
+    margin-top: 12px;
+    padding: 14px 42px;
+    font-size: 15px;
+    letter-spacing: 0.2em;
+    color: #fff;
+    background: linear-gradient(123deg, #18011F 7%, #B600A8 37%, #7621B0 72%, #BE4C00 100%);
+    border: none;
+    border-radius: 999px;
+    box-shadow: inset 0 0 0 2px rgba(255,255,255,0.35) inset, 0 10px 30px rgba(0,0,0,0.5);
+  }
+  #ink {
+    position: fixed;
+    inset: 0;
+    width: 100vw;
+    height: 100vh;
+    pointer-events: none;
+    z-index: 50;
+  }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<canvas id="ink"></canvas>
+
+<script>
+/* ===== 立即建页并启动循环（不等待任何外部脚本，CDN 挂起也不白屏） ===== */
+var TICK_CB = null;
+var useGSAP = false;
+
+function start() {
+  /* ===== 物理参数 ===== */
+  var COLS = 24;          // 网格列数（限制数量保流畅）
+  var ROWS = 13;          // 网格行数
+  var RADIUS = 160;       // 鼠标影响半径 px
+  var PRESS = 1.0;        // 按压强度（斥力）
+  var STIFF = 0.10;       // 回弹力 stiffness
+  var DAMP = 0.86;        // 阻尼
+  var R2 = RADIUS * RADIUS;
+
+  var stage = document.getElementById('stage');
+  var cw = window.innerWidth / COLS;
+  var ch = window.innerHeight / ROWS;
+
+  /* ===== 网格节点：(COLS+1)×(ROWS+1)，每个节点维护 home / cur / velocity ===== */
+  var nodes = [];
+  for (var r = 0; r <= ROWS; r++) {
+    for (var c = 0; c <= COLS; c++) {
+      nodes.push({ hx: c * cw, hy: r * ch, x: c * cw, y: r * ch, vx: 0, vy: 0 });
+    }
+  }
+  function nodeAt(c, r) { return nodes[r * (COLS + 1) + c]; }
+
+  /* ===== 逐格构建：外层 cell（溢出裁剪 + matrix3d 形变），内层 100vw×100vh 完整页面偏移切片 ===== */
+  var pageHTML =
+    '<div class="page">' +
+    '<h1>按压这块布</h1>' +
+    '<p>MOVE YOUR MOUSE · FEEL THE ELASTIC CLOTH</p>' +
+    '<button>开始体验</button>' +
+    '</div>';
+
+  var cells = [];
+  for (var cr = 0; cr < ROWS; cr++) {
+    for (var cc = 0; cc < COLS; cc++) {
+      var cell = document.createElement('div');
+      cell.className = 'cell';
+      cell.style.left = (cc * cw) + 'px';
+      cell.style.top = (cr * ch) + 'px';
+      cell.style.width = cw + 'px';
+      cell.style.height = ch + 'px';
+
+      var inner = document.createElement('div');
+      inner.className = 'cell-inner';
+      inner.style.transform = 'translate3d(' + (-cc * cw) + 'px,' + (-cr * ch) + 'px,0)';
+      inner.innerHTML = pageHTML;
+      cell.appendChild(inner);
+      stage.appendChild(cell);
+
+      cells.push({ el: cell, c: cc, r: cr, last: '' });
+    }
+  }
+
+  /* ===== 鼠标状态 ===== */
+  var mx = -99999, my = -99999;
+  window.addEventListener('mousemove', function (e) {
+    mx = e.clientX; my = e.clientY;
+  });
+  document.addEventListener('mouseleave', function () { mx = -99999; my = -99999; });
+
+  /* ?demo=1：自检时把虚拟光标固定在画面中心，截出凹陷形态 */
+  if (/[?&]demo=1/.test(location.search)) {
+    mx = window.innerWidth * 0.5;
+    my = window.innerHeight * 0.42;
+  }
+
+  /* ===== 投影矩阵：把单位正方形映射到四边形（matrix3d，列主序） ===== */
+  function quadMatrix3d(tlx, tly, trx, tryy, brx, bry, blx, bly) {
+    var A11 = trx - brx, A12 = blx - brx, B1 = -(trx + blx - tlx - brx);
+    var A21 = tryy - bry, A22 = bly - bry, B2 = -(tryy + bly - tly - bry);
+    var det = A11 * A22 - A12 * A21;
+    var a31 = det === 0 ? 0 : (B1 * A22 - A12 * B2) / det;
+    var a32 = det === 0 ? 0 : (A11 * B2 - B1 * A21) / det;
+    var a11 = trx * (1 + a31) - tlx;
+    var a21 = tryy * (1 + a31) - tly;
+    var a12 = blx * (1 + a32) - tlx;
+    var a22 = bly * (1 + a32) - tly;
+    var a13 = tlx, a23 = tly;
+    return 'matrix3d(' + [
+      a11, a21, 0, a31,
+      a12, a22, 0, a32,
+      0, 0, 1, 0,
+      a13, a23, 0, 1
+    ].map(function (v) { return v.toFixed(3); }).join(',') + ')';
+  }
+  var IDENT = 'none';
+
+  /* ===== 物理更新：回弹弹簧 + 鼠标斥力（随距离平方衰减） ===== */
+  function updatePhysics() {
+    for (var i = 0; i < nodes.length; i++) {
+      var n = nodes[i];
+      var fx = (n.hx - n.x) * STIFF;
+      var fy = (n.hy - n.y) * STIFF;
+      var dx = n.x - mx, dy = n.y - my;
+      var d2 = dx * dx + dy * dy;
+      if (d2 < R2) {
+        var d = Math.sqrt(d2) || 0.001;
+        var f = 1 - d / RADIUS;
+        f *= f;
+        fx += dx / d * f * PRESS;
+        fy += dy / d * f * PRESS;
+      }
+      n.vx = (n.vx + fx) * DAMP;
+      n.vy = (n.vy + fy) * DAMP;
+      n.x += n.vx;
+      n.y += n.vy;
+    }
+  }
+
+  /* ===== 每格四角位移 → matrix3d ===== */
+  function updateCells() {
+    for (var i = 0; i < cells.length; i++) {
+      var cell = cells[i];
+      var c = cell.c, r = cell.r;
+      var n00 = nodeAt(c, r),     n10 = nodeAt(c + 1, r);
+      var n11 = nodeAt(c + 1, r + 1), n01 = nodeAt(c, r + 1);
+
+      // 该格是否几乎无位移（回弹收敛后跳过写样式）
+      var maxDisp = Math.max(
+        Math.abs(n00.x - n00.hx), Math.abs(n00.y - n00.hy),
+        Math.abs(n10.x - n10.hx), Math.abs(n10.y - n10.hy),
+        Math.abs(n11.x - n11.hx), Math.abs(n11.y - n11.hy),
+        Math.abs(n01.x - n01.hx), Math.abs(n01.y - n01.hy)
+      );
+      if (maxDisp < 0.05) {
+        if (cell.last !== IDENT) { cell.el.style.transform = IDENT; cell.last = IDENT; }
+        continue;
+      }
+
+      var s = quadMatrix3d(
+        n00.x - n00.hx, n00.y - n00.hy,
+        cw + n10.x - n10.hx, n10.y - n10.hy,
+        cw + n11.x - n11.hx, ch + n11.y - n11.hy,
+        n01.x - n01.hx, ch + n01.y - n01.hy
+      ) + ' scale(' + (1 / cw) + ',' + (1 / ch) + ')';
+      if (cell.last !== s) { cell.el.style.transform = s; cell.last = s; }
+    }
+  }
+
+  /* ===== 主循环：rAF 兜底先跑起来；GSAP 异步到位后接管 ===== */
+  TICK_CB = function () {
+    updatePhysics();
+    updateCells();
+  };
+  (function rafLoop() {
+    if (!useGSAP) TICK_CB();
+    requestAnimationFrame(rafLoop);
+  })();
+  window.__clothReady = true;
+}
+
+start();
+
+/* ===== 异步加载 GSAP：成功后由 GSAP ticker 接管；失败则 rAF 兜底（带硬性断路器） ===== */
+var gsapSettled = false;
+(function tryGSAP() {
+  if (gsapSettled) return;
+  var urls = [
+    'https://cdn.jsdelivr.net/npm/gsap@3.12.5/dist/gsap.min.js',
+    'https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/gsap.min.js'
+  ];
+  var i = 0;
+  function next() {
+    if (gsapSettled || i >= urls.length) { gsapSettled = true; return; }
+    var url = urls[i++];
+    var s = document.createElement('script');
+    s.src = url;
+    s.onload = function () {
+      if (gsapSettled) return;
+      if (typeof gsap !== 'undefined' && TICK_CB) {
+        gsapSettled = true;
+        useGSAP = true;
+        try { gsap.ticker.add(TICK_CB); } catch (e) { useGSAP = false; }
+      } else {
+        next();
+      }
+    };
+    s.onerror = function () { if (!gsapSettled) next(); };
+    document.head.appendChild(s);
+  }
+  next();
+})();
+
+/* ===== 墨水绽放层：点击爆炸扩散 0.5s ~200px，2s 内淡出；拖曳留扭动轨迹 ===== */
+(function ink() {
+  var canvas = document.getElementById('ink');
+  var ctx = canvas.getContext('2d');
+  var DPR = Math.min(window.devicePixelRatio || 1, 2);
+  function resize() {
+    canvas.width = window.innerWidth * DPR;
+    canvas.height = window.innerHeight * DPR;
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+  resize();
+  window.addEventListener('resize', resize);
+
+  var particles = [];
+  var hue = Math.random() * 360;
+
+  function spawnBloom(x, y) {
+    hue = Math.random() * 360;              // 每次点击随机霓虹色
+    var n = 26;
+    for (var i = 0; i < n; i++) {
+      var ang = Math.random() * Math.PI * 2;
+      var sp = 60 + Math.random() * 220;     // 0.5s 内扩散到 ~200px
+      particles.push({
+        x: x + (Math.random() - 0.5) * 14,
+        y: y + (Math.random() - 0.5) * 14,
+        vx: Math.cos(ang) * sp,
+        vy: Math.sin(ang) * sp,
+        r: 4 + Math.random() * 12,
+        grow: 90 + Math.random() * 120,
+        age: 0,
+        life: 2.0,
+        wob: Math.random() * Math.PI * 2
+      });
+    }
+  }
+
+  function spawnTrail(x, y) {
+    particles.push({
+      x: x + (Math.random() - 0.5) * 8,
+      y: y + (Math.random() - 0.5) * 8,
+      vx: (Math.random() - 0.5) * 24,
+      vy: (Math.random() - 0.5) * 24,
+      r: 5 + Math.random() * 12,
+      grow: 26,
+      age: 0,
+      life: 1.6 + Math.random() * 0.8,
+      wob: Math.random() * Math.PI * 2
+    });
+  }
+
+  var down = false;
+  window.addEventListener('mousedown', function (e) {
+    down = true;
+    spawnBloom(e.clientX, e.clientY);
+  });
+  window.addEventListener('mouseup', function () { down = false; });
+  window.addEventListener('mousemove', function (e) {
+    if (down) spawnTrail(e.clientX, e.clientY);
+  });
+
+  var last = performance.now();
+  function loop(now) {
+    var dt = Math.min((now - last) / 1000, 0.05);
+    last = now;
+    ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+    if (particles.length) {
+      ctx.globalCompositeOperation = 'lighter';   // 霓虹发光叠加
+      for (var i = particles.length - 1; i >= 0; i--) {
+        var p = particles[i];
+        p.age += dt;
+        if (p.age >= p.life) { particles.splice(i, 1); continue; }
+        p.wob += dt * 7;                          // 自扭动
+        p.x += p.vx * dt + Math.cos(p.wob) * 10 * dt;
+        p.y += p.vy * dt + Math.sin(p.wob) * 10 * dt;
+        p.vx *= (1 - 3.2 * dt);
+        p.vy *= (1 - 3.2 * dt);
+        p.r += p.grow * dt;
+        var t = p.age / p.life;
+        // 前 0.5s 快速显色扩散，之后约 1.5s 淡出
+        var alpha = t < 0.25 ? t / 0.25 : 1 - (t - 0.25) / 0.75;
+        alpha = Math.max(0, Math.min(1, alpha));
+        var g = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, p.r);
+        g.addColorStop(0,   'hsla(' + hue + ', 100%, 65%, ' + (alpha * 0.38) + ')');
+        g.addColorStop(0.5, 'hsla(' + ((hue + 50) % 360) + ', 100%, 58%, ' + (alpha * 0.16) + ')');
+        g.addColorStop(1,   'hsla(' + hue + ', 100%, 55%, 0)');
+        ctx.fillStyle = g;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
